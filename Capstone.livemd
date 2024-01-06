@@ -1,0 +1,1052 @@
+<!-- livebook:{"file_entries":[{"name":"kc_house_data.csv","type":"attachment"}],"persist_outputs":true} -->
+
+# House Price Predictor
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.6.4"},
+  {:exla, "~> 0.6.4"},
+  {:scholar, "~> 0.2.1"},
+  {:explorer, "~> 0.7.2"},
+  {:vega_lite, "~> 0.1.8"},
+  {:kino, "~> 0.12.0"},
+  {:kino_explorer, "~> 0.1.13"},
+  {:kino_vega_lite, "~> 0.1.11"}
+])
+
+Nx.default_backend(EXLA.Backend)
+```
+
+## Dependencies
+
+```elixir
+require Explorer.DataFrame, as: DF
+require Explorer.Series, as: SR
+
+{:ok, "dependencies loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "dependencies loaded"}
+```
+
+```elixir
+alias VegaLite, as: Vl
+
+defmodule Graphics do
+  @moduledoc """
+  Provides functions for generating various types of visualizations for data analysis, 
+  including heatmaps, boxplots, and scatter plots.
+  """
+
+  @doc """
+  Generates a correlation matrix heatmap from a given dataframe.
+  ## Parameters
+  - `df`: The dataframe containing the data.
+  - `opts`: Options for the heatmap, including `:width` and `:height`.
+  ## Returns
+  A VegaLite chart representing the correlation matrix heatmap.
+  """
+  def correlation_matrix_heatmap(df, opts \\ []) do
+    width = Keyword.get(opts, :width, 650)
+    height = Keyword.get(opts, :height, 650)
+
+    corr_columns =
+      Nx.stack(df, axis: -1)
+      |> Scholar.Covariance.correlation_matrix()
+      |> DF.new()
+      |> DF.rename(df.names)
+      |> DF.to_columns()
+
+    corr_matrix =
+      Enum.flat_map(df.names, fn x ->
+        Enum.zip(df.names, corr_columns[x])
+        |> Enum.map(fn {y, corr} -> [x: x, y: y, corr: Float.round(corr, 2)] end)
+      end)
+
+    Vl.new(width: width, height: height)
+    |> Vl.data_from_values(corr_matrix)
+    |> Vl.encode_field(:x, "x", title: nil, type: :nominal)
+    |> Vl.encode_field(:y, "y", title: nil, type: :nominal)
+    |> Vl.layers([
+      Vl.new()
+      |> Vl.mark(:rect)
+      |> Vl.encode_field(:color, "corr",
+        type: :quantitative,
+        legend: [title: "Correlation"],
+        scale: [domain: [-1, 1], scheme: "yellowgreenblue"]
+      ),
+      Vl.new()
+      |> Vl.mark(:text)
+      |> Vl.encode_field(:text, "corr", type: :quantitative)
+      |> Vl.encode(:color,
+        condition: [test: "datum['corr'] > 0.5", value: "white"],
+        value: "black"
+      )
+    ])
+  end
+
+  @doc """
+  Creates boxplots for each feature in a given dataframe.
+  ## Parameters
+  - `df`: The dataframe containing the data.
+  ## Returns
+  A VegaLite chart with boxplots representing the distribution of each feature.
+  """
+  def boxplots(df) do
+    features_list = Enum.chunk_every(df.names(), 2)
+
+    box_plots =
+      fn features ->
+        Vl.new()
+        |> Vl.data_from_values(df)
+        |> Vl.repeat(
+          features,
+          Vl.new(width: 400, height: 40)
+          |> Vl.mark(:boxplot)
+          |> Vl.encode_repeat(:x, :repeat, type: :quantitative, scale: [zero: false])
+        )
+      end
+
+    Vl.new()
+    |> Vl.concat(Enum.map(features_list, fn features -> box_plots.(features) end), :vertical)
+  end
+
+  @doc """
+  Plots each feature in a dataframe against a target variable.
+  ## Parameters
+  - `df`: The dataframe containing the data.
+  - `target`: The target variable for comparison.
+  ## Returns
+  A VegaLite chart with scatter plots of features against the target variable.
+  """
+  def plot_features_against_target(df, target) do
+    features_list = Enum.chunk_every(DF.discard(df, "price").names(), 3)
+
+    scatter_plots =
+      fn features ->
+        Vl.new()
+        |> Vl.data_from_values(df)
+        |> Vl.repeat(
+          features,
+          Vl.new(width: 170, height: 170)
+          |> Vl.mark(:point, filled: true, opacity: 0.5)
+          |> Vl.encode_repeat(:x, :repeat, type: :quantitative)
+          |> Vl.encode_field(:y, target, type: :quantitative)
+        )
+      end
+
+    Vl.new()
+    |> Vl.concat(Enum.map(features_list, fn features -> scatter_plots.(features) end), :vertical)
+  end
+
+  @doc """
+  Creates scatter plots with PCA components and regression lines for different models.
+  ## Parameters
+  - `pca_data`: Data containing PCA components and other required fields.
+  ## Returns
+  A concatenated VegaLite chart with two scatter plots, each showing PCA components and 
+  regression lines.
+  """
+  def create_pca_scatter_plot(pca_data) do
+    scatter_1 = fn pca_data ->
+      Vl.new(width: 275, height: 275)
+      |> Vl.data_from_values(pca_data)
+      |> Vl.layers([
+        Vl.new()
+        |> Vl.mark(:point, opacity: 0.25, filled: true)
+        |> Vl.encode_field(:x, "x_test", title: "First Principal Component", type: :quantitative)
+        |> Vl.encode_field(:y, "y_test", title: "Housing Prices", type: :quantitative),
+        Vl.new()
+        |> Vl.mark(:line, color: "red", size: 3)
+        |> Vl.transform(regression: "y_test", on: "x_test")
+        |> Vl.encode_field(:x, "x_test", type: :quantitative)
+        |> Vl.encode_field(:y, "y_test", type: :quantitative)
+      ])
+    end
+
+    scatter_2 = fn pca_data ->
+      Vl.new(width: 275, height: 275)
+      |> Vl.data_from_values(pca_data)
+      |> Vl.layers([
+        Vl.new()
+        |> Vl.mark(:point, opacity: 0.25, filled: true)
+        |> Vl.encode_field(:x, "x_test", title: "First Principal Component", type: :quantitative)
+        |> Vl.encode_field(:y, "y_test", title: "Housing Prices", type: :quantitative),
+        Vl.new()
+        |> Vl.mark(:line, size: 3)
+        |> Vl.encode_field(:x, "x_test", type: :quantitative)
+        |> Vl.encode_field(:y, "value", type: :quantitative)
+        |> Vl.encode_field(:color, "variable", title: "Model", type: :nominal)
+      ])
+    end
+
+    Vl.new()
+    |> Vl.concat([scatter_1.(pca_data), scatter_2.(pca_data)])
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule DataPreparation do
+  @moduledoc """
+  Provides functions for preprocessing data, specifically focusing on filtering outliers.
+  """
+
+  @doc """
+  Filters outliers from a given dataframe using the Interquartile Range (IQR) method.
+  ## Parameters
+  - `dataframe`: The dataframe from which outliers will be removed.
+  - `n`: The number of iterations to recursively filter outliers (default is 7).
+  ## Details
+  Outliers are determined based on the IQR. Data points falling outside 1.5 times the IQR 
+  above the third quartile or below the first quartile are considered outliers.
+  ## Returns
+  A dataframe with outliers filtered out.
+  """
+  def filter_outliers(dataframe, n \\ 7) do
+    q1 = fn col -> SR.quantile(col, 0.25) end
+    q3 = fn col -> SR.quantile(col, 0.75) end
+    iqr = fn col -> SR.subtract(q3.(col), q1.(col)) end
+    upper = fn col -> SR.add(q3.(col), SR.multiply(iqr.(col), 1.5)) end
+    lower = fn col -> SR.subtract(q1.(col), SR.multiply(iqr.(col), 1.5)) end
+
+    case n do
+      0 ->
+        dataframe
+
+      _ ->
+        DF.filter(
+          dataframe,
+          for col <- across() do
+            SR.and(col >= ^lower.(col), col <= ^upper.(col))
+          end
+        )
+        |> filter_outliers(n - 1)
+    end
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule Utils do
+  @moduledoc """
+  Provides utility functions for handling dataframes in data analysis tasks.
+  """
+
+  @doc """
+  Splits a given dataframe into features (X) and target (Y) tensors.
+  ## Parameters
+  - `dataframe`: The dataframe to be split.
+  - `target`: The target column name in the dataframe.
+  ## Returns
+  A tuple where the first element is a tensor of features (X) and the second 
+  element is a tensor of the target variable (Y).
+  ## Details
+  The function discards the target column from the dataframe to form the features 
+  tensor and converts the target column into a separate tensor.
+  """
+  def split_dataframe(dataframe, target) do
+    x = Nx.stack(DF.discard(dataframe, target), axis: -1)
+    y = SR.to_tensor(dataframe[target])
+
+    {x, y}
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule StandardScale do
+  @moduledoc """
+  Provides functionality for standard scaling of tensors, commonly used in data preprocessing.
+  """
+
+  @doc """
+  Initializes a new StandardScale struct with nil mean and standard deviation.
+  ## Returns
+  A new StandardScale struct.
+  """
+  defstruct mean: nil, std: nil
+
+  @doc """
+  Computes the mean and standard deviation of a given tensor.
+  ## Parameters
+  - `tensor`: The tensor to be analyzed.
+  ## Returns
+  A StandardScale struct containing the mean and standard deviation of the tensor.
+  """
+  def fit(tensor) do
+    mean = Nx.mean(tensor, axes: [0])
+    std = Nx.standard_deviation(tensor, axes: [0])
+
+    %StandardScale{mean: mean, std: std}
+  end
+
+  @doc """
+  Applies standard scaling to a tensor using a given StandardScale struct.
+  ## Parameters
+  - `tensor`: The tensor to be scaled.
+  - `%StandardScale{mean: mean, std: std}`: A StandardScale struct with precomputed 
+  mean and standard deviation.
+  ## Returns
+  A tensor with applied standard scaling.
+  """
+  def transform(tensor, %StandardScale{mean: mean, std: std}) do
+    Nx.divide(Nx.subtract(tensor, mean), std)
+  end
+
+  @doc """
+  Fits a tensor and then applies standard scaling.
+  ## Parameters
+  - `tensor`: The tensor to be scaled.
+  ## Returns
+  A tensor that has been fitted and scaled using standard scaling.
+  """
+  def fit_transform(tensor) do
+    scaler = fit(tensor)
+    transform(tensor, scaler)
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule PCA do
+  @moduledoc """
+  Provides functionality for Principal Component Analysis (PCA), a common technique 
+  for dimensionality reduction in data analysis.
+  """
+
+  @doc """
+  Initializes a new PCA struct with a nil PCA model.
+  ## Returns
+  A new PCA struct.
+  """
+  defstruct pca_model: nil
+
+  @doc """
+  Fits a PCA model to a given tensor.
+  ## Parameters
+  - `tensor`: The tensor on which PCA is to be performed.
+  ## Returns
+  A PCA struct containing the fitted PCA model.
+  """
+  def fit(tensor) do
+    %PCA{pca_model: Scholar.Decomposition.PCA.fit(tensor)}
+  end
+
+  @doc """
+  Applies the PCA transformation to a tensor using a given PCA model.
+  ## Parameters
+  - `tensor`: The tensor to be transformed.
+  - `%PCA{pca_model: pca_model}`: A PCA struct with a pre-fitted PCA model.
+  ## Returns
+  A tensor transformed by the PCA model.
+  """
+  def transform(tensor, %PCA{pca_model: pca_model}) do
+    Scholar.Decomposition.PCA.transform(pca_model, tensor)
+  end
+
+  @doc """
+  Fits a PCA model to a tensor and then applies the PCA transformation.
+  ## Parameters
+  - `tensor`: The tensor to be fitted and transformed.
+  ## Returns
+  A tensor that has undergone PCA fitting and transformation.
+  """
+  def fit_transform(tensor) do
+    pca_model = fit(tensor)
+    transform(tensor, pca_model)
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule GraphDataFormatter do
+  @moduledoc """
+  Provides functions for preparing data for graphing, particularly for visualizations 
+  involving PCA and regression models.
+  """
+
+  @doc """
+  Formats data for PCA scatter plot graphs with predictions from various models.
+  ## Parameters
+  - `model_names`: A list of model names to be used for predictions.
+  - `{x_train, x_test}`: A tuple containing the training and testing data tensors for features.
+  - `{y_train, y_test}`: A tuple containing the training and testing data tensors for the 
+  target variable.
+  ## Returns
+  A DataFrame suitable for PCA scatter plot visualizations, containing PCA-transformed 
+  features, actual target values, and predictions from the specified models.
+  ## Details
+  The function standard scales the training data, fits and transforms it using PCA, and 
+  then predicts the target variable using the provided models. It combines PCA components, 
+  actual target values, and predictions into a DataFrame for visualization.
+  """
+  def pca_scatter_data(model_names, {x_train, x_test}, {y_train, y_test}) do
+    scaler = StandardScale.fit(x_train)
+    scaled_x_train = StandardScale.transform(x_train, scaler)
+
+    pca_model = Scholar.Decomposition.PCA.fit(scaled_x_train, num_components: 1)
+    pca_x_train = Scholar.Decomposition.PCA.transform(pca_model, scaled_x_train)
+
+    scaled_x_test = StandardScale.transform(x_test, scaler)
+    pca_x_test = Scholar.Decomposition.PCA.transform(pca_model, scaled_x_test)
+
+    Enum.map(model_names, fn model_name ->
+      Module.concat(Scholar.Linear, model_name).fit(pca_x_train, y_train)
+      |> then(&Module.concat(Scholar.Linear, model_name).predict(&1, pca_x_test))
+      |> then(&{Atom.to_string(model_name), SR.from_tensor(&1)})
+    end)
+    |> Enum.into(%{})
+    |> Map.merge(%{"x_test" => SR.from_tensor(pca_x_test), "y_test" => SR.from_tensor(y_test)})
+    |> DF.new()
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule Pipeline do
+  @moduledoc """
+  Provides a pipeline for data preprocessing and model fitting, integrating standard scaling, PCA, and model training.
+  """
+
+  @doc """
+  Fits a pipeline with given data and a model.
+  ## Overloaded Functions
+  - `fit_pipeline(model_name, {x, y})`: Takes model name and data tuple.
+  - `fit_pipeline({x, y}, model_name)`: Takes data tuple and model name.
+  ## Parameters
+  - `model_name`: The name of the model to fit.
+  - `{x, y}`: A tuple containing the feature matrix `x` and target vector `y`.
+  ## Returns
+  A tuple containing the fitted model, the scaler, PCA model, and the model name.
+  ## Details
+  This function applies standard scaling and PCA to the features, then fits the 
+  specified regression model to the transformed data.
+  """
+  def fit_pipeline(model_name, {x, y}), do: fit_pipeline({x, y}, model_name)
+
+  def fit_pipeline({x, y}, model_name) do
+    # standard scale
+    scaler = StandardScale.fit(x)
+    scaled_x = StandardScale.transform(x, scaler)
+
+    # PCA
+    pca_model = PCA.fit(scaled_x)
+    pca_x = PCA.transform(scaled_x, pca_model)
+
+    # model
+    fitted_model = Module.concat(Scholar.Linear, model_name).fit(pca_x, y)
+
+    {fitted_model, scaler, pca_model, model_name}
+  end
+
+  @doc """
+  Transforms features and predicts the target using a fitted pipeline.
+  ## Overloaded Functions
+  - `transform_and_predict(x, {fitted_model, scaler, pca_model, model_name})`: Takes features 
+  and a pipeline tuple.
+  - `transform_and_predict({fitted_model, scaler, pca_model, model_name}, x)`: Takes a pipeline 
+  tuple and features.
+  ## Parameters
+  - `x`: The features to be transformed and predicted.
+  - `{fitted_model, scaler, pca_model, model_name}`: A tuple containing a fitted model, scaler, 
+  PCA model, and model name.
+  ## Returns
+  Predictions generated by the model after applying standard scaling and PCA transformation to 
+  the input features.
+  """
+  def transform_and_predict(x, {fitted_model, scaler, pca_model, model_name}) do
+    transform_and_predict({fitted_model, scaler, pca_model, model_name}, x)
+  end
+
+  def transform_and_predict({fitted_model, scaler, pca_model, model_name}, x) do
+    StandardScale.transform(x, scaler)
+    |> PCA.transform(pca_model)
+    |> then(&Module.concat(Scholar.Linear, model_name).predict(fitted_model, &1))
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule ModelSelection do
+  @moduledoc """
+  Provides functions for model selection and validation, including cross-validation and 
+  scoring metrics.
+  """
+
+  @metrics [:R2, :MAE, :MSE, :RMSE]
+
+  @doc """
+  Performs cross-validation on a list of models using given data.
+  ## Parameters
+  - `model_names`: A list of model names to be evaluated.
+  - `{x, y}`: A tuple containing the feature matrix `x` and target vector `y`.
+  - `k`: The number of folds for cross-validation (default is 3).
+  ## Returns
+  A list of performance metrics for each model after cross-validation.
+  ## Details
+  The function applies cross-validation to each model in `model_names`, computing metrics 
+  such as R2, MAE, MSE, and RMSE. It returns the average of these metrics over all folds.
+  """
+  def cross_validation(model_names, {x, y}, k \\ 3) do
+    {x_train, _} = Nx.split(x, 0.8)
+    {y_train, _} = Nx.split(y, 0.8)
+
+    Enum.map(model_names, fn model_name ->
+      folding_func = fn x -> Scholar.ModelSelection.k_fold_split(x, k) end
+      scoring_func = create_scoring_func(model_name)
+
+      Scholar.ModelSelection.cross_validate(x_train, y_train, folding_func, scoring_func)
+      |> Nx.mean(axes: [1])
+      |> label_metrics(model_name)
+    end)
+  end
+
+  @doc """
+  Validates a list of models using a given dataset.
+  ## Parameters
+  - `model_names`: A list of model names to be evaluated.
+  - `{x, y}`: A tuple containing the feature matrix `x` and target vector `y`.
+  ## Returns
+  A list of performance metrics for each model.
+  ## Details
+  The function evaluates each model in `model_names` on the given dataset, computing 
+  metrics such as R2, MAE, MSE, and RMSE.
+  """
+  def model_validation(model_names, {x, y}) do
+    x = Nx.split(x, 0.8)
+    y = Nx.split(y, 0.8)
+
+    Enum.map(model_names, fn model_name ->
+      scoring_func = create_scoring_func(model_name)
+
+      scoring_func.(x, y)
+      |> Nx.stack()
+      |> label_metrics(model_name)
+    end)
+  end
+
+  defp create_scoring_func(model_name) do
+    fn x, y ->
+      {x_train, x_test} = x
+      {y_train, y_test} = y
+
+      {x_train, y_train}
+      |> Pipeline.fit_pipeline(model_name)
+      |> Pipeline.transform_and_predict(x_test)
+      |> calculate_metrics(y_test)
+    end
+  end
+
+  defp calculate_metrics(prediction, y_test) do
+    metrics = [
+      :r2_score,
+      :mean_absolute_error,
+      :mean_square_error,
+      {:mean_square_error, &Nx.sqrt/1}
+    ]
+
+    Enum.map(metrics, fn
+      {mse, sqrt} -> apply(Scholar.Metrics.Regression, mse, [y_test, prediction]) |> sqrt.()
+      metric -> apply(Scholar.Metrics.Regression, metric, [y_test, prediction])
+    end)
+  end
+
+  defp label_metrics(tensor, model_name) do
+    Nx.to_list(tensor)
+    |> Enum.zip_reduce(@metrics, [], &[{&2, Float.round(&1, 5)} | &3])
+    |> Enum.concat(MODEL: Atom.to_string(model_name))
+    |> Enum.reverse()
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+```elixir
+defmodule Interface do
+  @moduledoc """
+  Provides an interface for interacting with a fitted model pipeline, allowing users to 
+  input data and receive predictions.
+  """
+
+  @doc """
+  Runs the interface for a fitted pipeline and a given dataframe.
+  ## Parameters
+  - `fitted_pipeline`: The pipeline that has been fitted with training data.
+  - `dataframe`: The dataframe used to provide additional context for predictions.
+  ## Returns
+  An interactive form that allows users to input feature values and receive predicted results.
+  ## Details
+  This function creates an interactive form with fields for bedrooms, bathrooms, and square 
+  footage. Upon submission, it combines the user's input with median values from the dataframe 
+  and top zip code latitude-longitude data. It then feeds this combined data into the pipeline 
+  to generate and display a predicted house price.
+  """
+  def run(fitted_pipeline, dataframe) do
+    input_form =
+      Kino.Control.form(
+        [
+          bed: Kino.Input.number("Bedrooms", default: 0),
+          bath: Kino.Input.number("Bathrooms", default: 0),
+          sqft_living: Kino.Input.number("Square Footage", default: 0)
+        ],
+        submit: "Calculate Price"
+      )
+
+    Kino.listen(input_form, fn data ->
+      %{data: %{bed: bed, bath: bath, sqft_living: sqft_living}} = data
+
+      dataframe = DF.discard(dataframe, "price")
+
+      top_zip_lat_long =
+        dataframe["zipcode"]
+        |> SR.frequencies()
+        |> DF.pull(0)
+        |> SR.first()
+        |> then(&DF.filter_with(dataframe, fn df -> SR.equal(df["zipcode"], &1) end))
+        |> DF.frequencies(["lat", "long", "zipcode"])
+        |> DF.filter_with(&SR.equal(&1["counts"], SR.max(&1["counts"])))
+        |> DF.discard("counts")
+        |> DF.to_series()
+        |> Enum.reduce(%{}, fn {k, s}, acc -> Map.put(acc, k, SR.first(s)) end)
+
+      dataframe_means =
+        dataframe
+        |> DF.to_series()
+        |> Enum.reduce(%{}, fn {k, s}, acc -> Map.merge(acc, %{k => SR.median(s)}) end)
+
+      prediction =
+        dataframe_means
+        |> Map.merge(%{"bathrooms" => bath, "bedrooms" => bed, "sqft_living" => sqft_living})
+        |> Map.merge(top_zip_lat_long)
+        |> Map.values()
+        |> Nx.tensor()
+        |> Nx.stack()
+        |> Pipeline.transform_and_predict(fitted_pipeline)
+        |> Nx.reshape(1)
+        |> Nx.to_number()
+        |> Float.round(2)
+
+      selection = "Given #{bed} Bedrooms, #{bath} Bathrooms, and #{sqft_living} Square Footage\n"
+      predicted_price = "Estimated House Price: $#{prediction}"
+      IO.puts(selection <> predicted_price)
+    end)
+
+    input_form
+  end
+end
+
+{:ok, "module loaded"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "module loaded"}
+```
+
+## Data Collection
+
+In the project's initial phase, the housing dataset is obtained from Kaggle, containing information about houses sold in King County, Washington, between 2014 and 2015. The dataset can be accessed through this [link](https://www.kaggle.com/datasets/harlfoxem/housesalesprediction).
+
+A data frame named `dataframe` will be created from the CSV file using the provided URL.
+
+This phase marks the project's starting point, involving gathering and preparing essential data for analysis and modeling.
+
+```elixir
+# Establish path to CSV file
+path = "https://raw.githubusercontent.com/Hooahclitus/capstone_data/main/kc_house_data.csv"
+
+# Create a dataframe from the provided path
+dataframe = DF.from_csv!(path)
+
+{:ok, "dataframe created"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "dataframe created"}
+```
+
+## Data Preprocessing
+
+In the Data Preprocessing phase, the primary focus is preparing the dataset to optimize its suitability for the regression model. This process begins with removing two features that have limited relevance for prediction: `id` and `date`.
+
+* `id`: This feature offers no value for regression modeling and is consequently excluded from the data frame.
+* `date`: While this feature represents the date when a house was sold, its contribution to the analysis is limited. Therefore, it is removed from the data frame.
+
+```elixir
+dataframe = DF.discard(dataframe, ["id", "date"])
+```
+
+After removing both `id` and `date` from the data frame, it is observed that the dataset contains no null or missing values. This data integrity confirms that the dataset is fully prepared for further analysis and modeling.
+
+## Exploratory Data Analysis
+
+In the Exploratory Data Analysis (EDA) phase of our project, we initiate an in-depth examination of our housing dataset. This phase serves as a fundamental starting point in any data-driven project, as it enables us to unearth critical insights and discern underlying patterns within the dataset. By thoroughly exploring the data, we aim to gain a deeper understanding of its characteristics and intricacies, laying the groundwork for informed decision-making in subsequent phases of our project.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Correlation Heat Map Analysis
+
+The initial step involves developing a correlation matrix heat map to represent the interactions among different dataset features graphically. This visual representation is essential for isolating variables significantly correlating with the target variable, `price`. The clarity provided by the heat map is invaluable for discerning impactful features, a key aspect in choosing relevant data for the model and in the overall process of building a predictive model.
+
+```elixir
+Graphics.correlation_matrix_heatmap(dataframe)
+```
+
+The exploratory data analysis (EDA) revealed through the correlation heat map that several features correlate 0.5 or greater with the target variable, `price`.
+
+The identified features include:
+
+* **Bathrooms**: A positive correlation exists between the number of bathrooms in a house and its price. Increasing the number of bathrooms tends to correlate with a price rise.
+* **Grade**: Higher-grade properties are linked to higher prices. This positive correlation indicates that houses with superior grades command higher prices in the market.
+* **Sqft_above**: The square footage of the living space above ground level shows a positive correlation with the price. Larger above-ground living spaces generally correlate with higher property prices.
+* **Sqft_living**: The living space's total square footage strongly correlates positively with the price. Larger living spaces are often associated with higher property prices.
+* **Sqft_living15**: The square footage of the living area for the nearest 15 neighboring properties also positively correlates with the price, suggesting that the size of neighboring properties' living areas influences a house's price linearly.
+
+It is also important to note that these findings indicate the presence of multicollinear relationships, where some features may correlate with each other. Understanding and managing these relationships is crucial for the subsequent analysis and modeling phase.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Scatterplots Analysis
+
+This section of the analysis delves into scatterplots that showcase the relationship between individual features and the target variable, `price`. The objective is to identify features that exhibit a discernible linear correlation with housing prices. Visual inspection of these scatterplots aims to pinpoint potential predictors influencing a house's price.
+
+```elixir
+Graphics.plot_features_against_target(dataframe, "price")
+```
+
+A thorough examination of the scatterplots has identified several features demonstrating a noticeable linear correlation with the target variable, `price`.
+
+These features include:
+
+* **Bathrooms**: A positive linear relationship exists between the number of bathrooms in a house and its price. An increase in bathrooms typically correlates with a price rise.
+* **Grade**: Higher-grade properties display a clear positive linear correlation with the price. Houses with superior grades often command higher prices in the market.
+* **Sqft_above**: The square footage of the living space above ground level shows a positive linear relationship with the price. Larger above-ground living spaces are associated with higher property prices.
+* **Sqft_basement**: The square footage of the basement area exhibits a positive linear correlation with the price. Houses with larger basements tend to have higher prices.
+* **Sqft_living**: The total square footage of the living space has a strong positive linear correlation with the price. Larger living spaces are typically linked to higher property prices.
+* **Sqft_living15**: The square footage of the living area for the nearest 15 neighboring properties shows a positive linear relationship with the price, suggesting the size of neighboring properties' living areas linearly influences a house's price.
+
+These findings provide insights into features that possess a linear relationship with housing prices, making them potential candidates for inclusion in predictive modeling due to their likely significant contribution to the accuracy of the price prediction model.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Boxplots Analysis
+
+This section utilizes standard boxplots to explore each feature's distribution within the dataset visually. The primary goal is to identify any potential outliers that may exist. Detecting outliers is crucial for maintaining data integrity and determining whether outlier handling, such as filtering or transformation, is required for analysis and modeling.
+
+```elixir
+Graphics.boxplots(dataframe)
+```
+
+Analysis of the boxplots has shown that outliers are present in multiple features. These outliers are data points that substantially diverge from the normal value range. Addressing these outliers through further analysis and potentially applying outlier handling methods is essential to prevent negative impacts on the modeling process.
+
+Additionally, it's observed that four features - `sqft_basement`, `view`, `waterfront`, and `yr_renovated` - display atypical boxplots. This unusual pattern might result from a lack of variability in their data distributions. A closer look and possible data transformations might be required to improve the utility of these features in the predictive modeling process.
+
+## Data Preparation
+
+This section focuses on preparing the dataset for modeling based on insights gained during the exploratory data analysis (EDA). The process will address multicollinearity, manage outliers, and handle unusual features observed in the dataset. These steps are crucial for optimizing the data and ensuring its suitability for the housing price prediction model.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Handling Unusual Features
+
+This section addresses the peculiarities observed in certain features based on the unfiltered boxplots. The approach involves examining each feature's mode to understand the unusual data distribution patterns better.
+
+```elixir
+filter_mode =
+  DF.to_series(dataframe)
+  |> Enum.reduce([], fn {k, s}, acc ->
+    if (mode = Nx.to_number(Nx.mode(s))) == 0,
+      do: [%{feature: k, mode: mode} | acc],
+      else: acc
+  end)
+  |> Enum.sort()
+  |> DF.new()
+```
+
+Further analysis reveals that certain features in the dataset, namely `sqft_basement`, `view`, `waterfront`, and `yr_renovated`, all have a mode value of zero. These features, previously identified with unconventional boxplot patterns, are confirmed to have limited variability. This observation highlights their diminished importance for modeling efforts. Consequently, eliminating these features helps streamline the dataset, ensuring focus on the most relevant variables crucial for the housing price prediction model.
+
+```elixir
+dataframe = DF.discard(dataframe, filter_mode["feature"] |> SR.to_list())
+
+{:ok, "dataframe updated"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "dataframe updated"}
+```
+
+### Handling Outliers
+
+During the data preparation phase, the emphasis is on addressing outliers within the dataset. A custom function employing the Interquartile Range (IQR) method will filter these outliers. Outliers are identified explicitly as data points that fall below the first quartile minus 1.5 times the IQR or above the third quartile plus 1.5 times the IQR. Implementing this method is crucial to ensure that extreme data points do not disproportionately impact the modeling process. This approach is necessary to enable more reliable and accurate predictions in the housing price model.
+
+```elixir
+dataframe = DataPreparation.filter_outliers(dataframe)
+
+{:ok, "dataframe updated"}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, "dataframe updated"}
+```
+
+Following the application of the outlier filter, the updated dataset is represented in a boxplot. This boxplot visibly confirms the effective removal of outliers, showcasing a dataset that is now cleaner and more uniform. Eliminating these extreme values is instrumental in ensuring more consistent and realistic data for analysis.
+
+```elixir
+Graphics.boxplots(dataframe)
+```
+
+Post-outlier removal, scatter plots of the dataset's features against price reveal a more uniform distribution of data points. This uniformity indicates a dataset that reflects housing market trends more accurately, which is essential for improving predictive modeling and capturing key market relationships.
+
+```elixir
+Graphics.plot_features_against_target(dataframe, "price")
+```
+
+Following the implementation of outlier removal using the Interquartile Range (IQR) method, outliers have been identified and removed from the dataset. This process enhances the robustness and reliability of the dataset, ensuring that extreme data points do not exert undue influence on the modeling process. With outliers effectively managed, there is greater confidence in the data's integrity and suitability for building a housing price prediction model.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Standard Scale
+
+This section explores standard scaling, a fundamental data preprocessing technique in machine learning and statistics. Standard scaling, also known as z-score normalization, transforms numerical features within the dataset to a standardized scale with a mean of zero and a standard deviation of one. This process enables direct comparisons between features with different units and scales, enhancing the stability of machine learning algorithms. It contributes to more accurate predictions and simplified model interpretation. Standard scaling will be applied to the dataset to optimize it for the housing price prediction model.
+
+```elixir
+x = DF.discard(dataframe, "price")
+y = DF.select(dataframe, "price")
+
+scaled_x =
+  Nx.stack(x, axis: -1)
+  |> StandardScale.fit_transform()
+  |> DF.new()
+  |> DF.rename(x.names)
+
+scaled_x
+```
+
+```elixir
+DF.summarise(
+  scaled_x,
+  for col <- across() do
+    {col.name, standard_deviation(col)}
+  end
+)
+```
+
+After applying standard scaling to the dataset, the following outcomes have been observed:
+
+* **Mean of Zero**: The standard scaling transformation has successfully centered the numerical features, resulting in a mean (average) of zero for each scaled feature. This centralization simplifies the interpretation of feature contributions in the modeling process.
+* **Consistent Scaling**: Standard scaling uniformly scales all numerical values within the data frame, ensuring that each feature has a standard deviation of one. This consistency allows for direct comparisons between features with different original units or scales, significantly improving the reliability of the housing price prediction model.
+
+It's important to note that standard scaling is beneficial and a fundamental requirement for Principal Component Analysis, the next step in the analysis. Standard scaling ensures that Principal Component Analysis can effectively extract meaningful patterns and reduce dimensionality while maintaining the integrity of the data.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Principal Component Analysis
+
+This section explores Principal Component Analysis (PCA), a potent dimensionality reduction technique commonly applied in data analysis and modeling. The primary objective of PCA is to transform the dataset into a new set of uncorrelated variables known as principal components. These components capture the maximum variance within the data, offering an opportunity to simplify complex datasets while retaining essential information. Implementing PCA reduces the dimensionality of the dataset, improves modeling efficiency, and provides valuable insights into feature importance.
+
+```elixir
+pca_x =
+  Nx.stack(scaled_x, axis: -1)
+  |> PCA.fit_transform()
+  |> DF.new()
+  |> DF.rename(scaled_x.names)
+
+DF.head(pca_x)
+```
+
+After the PCA transformation of the dataset, significant changes are observed:
+
+* **Dimensionality Preservation**: PCA retains several principal components equal to the original number of features. These components are ordered so that the first component contains the most variance, followed by subsequent components with decreasing variance. This arrangement helps maintain the essential aspects of the data while potentially reducing noise.
+* **Uncorrelated Features**: A key strength of PCA is its ability to produce uncorrelated principal components. This feature is beneficial in mitigating multicollinearity issues, which can hinder model performance when working with the original features.
+
+<!-- livebook:{"break_markdown":true} -->
+
+The impact of PCA on the dataset can be effectively demonstrated through a correlation heatmap of the transformed data. This visual representation will highlight how PCA has altered the relationships between features, showcasing the new, uncorrelated structure of the principal components.
+
+```elixir
+DF.concat_columns(pca_x, y)
+|> Graphics.correlation_matrix_heatmap(width: 500, height: 500)
+```
+
+After the PCA transformation, the correlation heatmap shows a substantial reduction in the strength of relationships among features, effectively mitigating multicollinearity. While the principal components are uncorrelated, noteworthy correlations persist between these components and the target feature, `price`. This heatmap highlights the efficacy of PCA in alleviating multicollinearity issues while preserving significant associations with the target variable.
+
+The data preparation section has involved crucial steps to optimize the dataset for modeling. These steps included addressing outliers to remove problematic data points, standardizing numerical features for consistent scaling, and managing peculiarities in certain features by eliminating those with dominant mode values. This data preparation process establishes a solid foundation for the housing price prediction model, ensuring accuracy and reliability in the subsequent phases of the project.
+
+## Model Development
+
+### Note: On Data Leakage
+
+Before proceeding with model development, it is essential to address the data leakage issue. Data leakage can occur when preprocessing steps, like feature scaling or transformation, are applied to the entire dataset before splitting it into train and test sets. To avoid data leakage, it's vital to perform preprocessing steps exclusively on the training data. This practice ensures the integrity of model evaluation by using the test data in its original form, which helps to avoid inaccuracies and ensures the reliability of the predictive model.
+
+Therefore, all models in this project will be trained using the training data and evaluated using the test data. This approach ensures that the performance metrics are derived from the model's ability to generalize to new, unseen data, accurately assessing its predictive effectiveness.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Cross-validation and Model Selection
+
+This section focuses on cross-validation, a valuable model evaluation and selection technique. Cross-validation assesses a model's performance by dividing data into training and test sets. The procedure involves a k-fold split of three within the 80% of data designated for training, ensuring each part is used for validation and training. The remaining 20% of the dataset, reserved as test data, is separate from cross-validation.
+
+The process will be applied to various regression models, evaluating them using metrics like R2, MAE, MSE, and RMSE to determine their prediction accuracy. The aim is to select the best regression model for housing price prediction based on its performance on the training data and its ability to generalize to new data.
+
+```elixir
+[:LinearRegression, :RidgeRegression, :PolynomialRegression]
+|> ModelSelection.cross_validation(Utils.split_dataframe(dataframe, "price"))
+|> DF.new()
+```
+
+In the cross-validation process, three regression models - polynomial, ridge, and linear - were evaluated for their effectiveness in predicting housing prices.
+
+Four key metrics were used:
+
+* **R2 (Coefficient of Determination)**: Measures the proportion of predictable variance in `price` from independent variables. A higher R2 score indicates a better model fit, with values closer to 1 being desirable.
+* **MAE (Mean Absolute Error)**: Quantifies the average error magnitude between predicted and actual values. Lower MAE values indicate more accurate predictions.
+* **MSE (Mean Squared Error)**: Computes the average squared differences between predicted and actual values. Lower MSE values signify less error dispersion.
+* **RMSE (Root Mean Squared Error)**: Measures the standard deviation of prediction errors. RMSE is the square root of MSE. Lower RMSE values indicate better predictive accuracy.
+
+Cross-validation results showed that polynomial regression was superior, with higher R2 scores and lower MAE, MSE, and RMSE values, making it more effective for predicting housing prices than ridge and linear regression.
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### Considerations
+
+Although the polynomial regression model showed promising metrics during cross-validation, it's important to consider its practicality in real-world applications. The graph of the model may exhibit downward or upward trends at extremely high or low values due to its polynomial nature. This behavior is a consideration, especially when compared to the more consistent performance of the ridge and linear models across a wide range of values.
+
+```elixir
+{x, y} = Utils.split_dataframe(dataframe, "price")
+
+[:LinearRegression, :RidgeRegression, :PolynomialRegression]
+|> GraphDataFormatter.pca_scatter_data(Nx.split(x, 0.8), Nx.split(y, 0.8))
+|> DF.pivot_longer(["LinearRegression", "RidgeRegression", "PolynomialRegression"])
+|> Graphics.create_pca_scatter_plot()
+```
+
+The left graph shows a scatter plot with the first principal component as x-values and housing prices as y-values, using training data, and includes a red regression line. The right graph shows the same scatter plot and includes prediction lines from different models based on the first principal component. It displays a gold polynomial regression line, a red ridge regression line, and a blue linear regression line. The overlap of the red ridge regression line with the blue linear regression line in this graph suggests similar performance of these two models.
+
+Based on the observations and considerations, the polynomial regression model will be used for further training and evaluation. Despite its slight upward trend at higher values, which may sometimes overestimate or underestimate housing prices, its overall performance is promising. The model's ability to capture complex patterns makes it suitable for predicting housing prices, provided it is managed carefully to ensure accuracy.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Model Training and Evaluation
+
+In this phase, following cross-validation, the polynomial regression model will undergo testing using an 80/20 data split. The training data, which makes up 80% of the dataset, will be used for further model training. This step is essential to verify the model's robustness and ensure that the positive results from cross-validation are not merely due to overfitting but because the model effectively captures the dataset's complexities.
+
+The test data, representing the remaining 20% of the dataset, is set aside for this phase and has not been previously used, thereby avoiding data leakage. The model's performance will be evaluated, providing a trustworthy measure of its ability to generalize to new, unseen data.
+
+```elixir
+[:PolynomialRegression]
+|> ModelSelection.model_validation(Utils.split_dataframe(dataframe, "price"))
+|> DF.new()
+```
+
+Evaluating the polynomial regression model showed performance metrics differing slightly from those obtained during cross-validation but still indicating a strong model performance. This variance is a regular aspect of applying a model to different data subsets and does not detract from the model's overall reliability. The model's performance in cross-validation and evaluation phases suggests it is well-suited for accurate and reliable housing price predictions.
+
+## Model Application
+
+In this concluding phase of the project, the polynomial regression model will be trained using the entire dataset, and a user interface will be introduced for seamless interaction. Users can input their desired number of bedrooms, bathrooms, and square footage. For features not provided by the user, median values from the dataset will be used to ensure prediction accuracy.
+
+Geographical precision will be enhanced by considering latitude and longitude data. The most frequent zip code in the dataset will be identified, and the most common pair of latitude and longitude coordinates corresponding to that zip code will be selected. This method ensures that location data closely aligns with the user's specified zip code.
+
+Once all necessary data, including user input and median values from the dataset, are compiled, the information will be combined and subjected to standard scaling and PCA to optimize the model's efficiency. The prediction process is designed to offer a practical and user-friendly approach to estimating real-world housing prices.
+
+```elixir
+dataframe_split = Utils.split_dataframe(dataframe, "price")
+
+Kino.Layout.grid(
+  [
+    Kino.Layout.grid([
+      Kino.Markdown.new("**Polynomial Model**"),
+      dataframe_split
+      |> Pipeline.fit_pipeline(:PolynomialRegression)
+      |> Interface.run(dataframe)
+    ]),
+    Kino.Layout.grid([
+      Kino.Markdown.new("**Ridge Model**"),
+      dataframe_split
+      |> Pipeline.fit_pipeline(:RidgeRegression)
+      |> Interface.run(dataframe)
+    ])
+  ],
+  columns: 2
+)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Given 3 Bedrooms, 2 Bathrooms, and 2500000002 Square Footage
+Estimated House Price: $-2.7618134975023658e17
+```
