@@ -721,7 +721,7 @@ This phase marks the project's starting point, involving gathering and preparing
 
 ```elixir
 # Establish path to CSV file
-path = "https://raw.githubusercontent.com/Hooahclitus/capstone_data/main/kc_house_data.csv"
+path = "https://raw.githubusercontent.com/Hooahclitus/Capstone-Project/main/kc_house_data.csv"
 
 # Create a dataframe from the provided path
 dataframe = DF.from_csv!(path)
